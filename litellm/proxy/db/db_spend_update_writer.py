@@ -46,6 +46,7 @@ from litellm.proxy._types import (
     SpendLogsPayload,
     SpendUpdateQueueItem,
     ToolDiscoveryQueueItem,
+    hash_token,
 )
 from litellm.proxy.db.db_transaction_queue.daily_spend_update_queue import (
     DailySpendUpdateQueue,
@@ -110,7 +111,7 @@ class DBSpendUpdateWriter:
             prisma_client,
             user_api_key_cache,
         )
-        from litellm.proxy.utils import ProxyUpdateSpend, hash_token
+        from litellm.proxy.utils import ProxyUpdateSpend
 
         try:
             verbose_proxy_logger.debug(
@@ -135,6 +136,10 @@ class DBSpendUpdateWriter:
                 end_time=end_time,
             )
             payload["spend"] = response_cost or 0.0
+            hashed_token = self._resolve_hashed_token_for_key_spend(
+                hashed_token=hashed_token,
+                payload_api_key=payload.get("api_key"),
+            )
             if isinstance(payload["startTime"], datetime):
                 payload["startTime"] = payload["startTime"].isoformat()
             if isinstance(payload["endTime"], datetime):
@@ -470,6 +475,26 @@ class DBSpendUpdateWriter:
                 traceback.format_exc(),
             )
 
+    @staticmethod
+    def _resolve_hashed_token_for_key_spend(
+        hashed_token: Optional[str],
+        payload_api_key: Optional[str],
+    ) -> Optional[str]:
+        """
+        Use the same key identifier SpendLogs persist when `token` is missing.
+
+        SpendLogs can resolve api_key from standard_logging_object.metadata.user_api_key_hash
+        even when the update_database `token` argument is None. Key spend must use that
+        same identifier so LiteLLM_VerificationToken.spend tracks logged spend.
+        """
+        if hashed_token:
+            return hashed_token
+        if not payload_api_key:
+            return hashed_token
+        if isinstance(payload_api_key, str) and payload_api_key.startswith("sk-"):
+            return hash_token(payload_api_key)
+        return payload_api_key
+
     async def _update_key_db(
         self,
         response_cost: Optional[float],
@@ -477,7 +502,7 @@ class DBSpendUpdateWriter:
         prisma_client: Optional[PrismaClient],
     ):
         try:
-            if hashed_token is None or prisma_client is None:
+            if not hashed_token or prisma_client is None:
                 return
 
             await self.spend_update_queue.add_update(

@@ -1428,3 +1428,200 @@ async def test_commit_spend_updates_uses_pipeline():
     mock_redis_update_buffer.get_all_daily_end_user_spend_update_transactions_from_redis_buffer.assert_not_called()
     mock_redis_update_buffer.get_all_daily_agent_spend_update_transactions_from_redis_buffer.assert_not_called()
     mock_redis_update_buffer.get_all_daily_tag_spend_update_transactions_from_redis_buffer.assert_not_called()
+
+
+def _mock_prisma_for_key_spend_commit():
+    mock_batcher = MagicMock()
+    mock_batcher.litellm_verificationtoken = MagicMock()
+    mock_batcher.litellm_verificationtoken.update_many = MagicMock()
+    mock_batcher.litellm_usertable = MagicMock()
+    mock_batcher.litellm_usertable.update_many = MagicMock()
+    mock_batcher.litellm_teamtable = MagicMock()
+    mock_batcher.litellm_teamtable.update_many = MagicMock()
+    mock_batcher.litellm_teammembership = MagicMock()
+    mock_batcher.litellm_teammembership.update_many = MagicMock()
+    mock_batcher.litellm_organizationtable = MagicMock()
+    mock_batcher.litellm_organizationtable.update_many = MagicMock()
+    mock_batcher.litellm_tagtable = MagicMock()
+    mock_batcher.litellm_tagtable.update_many = MagicMock()
+    mock_batcher.litellm_agentstable = MagicMock()
+    mock_batcher.litellm_agentstable.update_many = MagicMock()
+
+    mock_transaction = AsyncMock()
+    mock_transaction.__aenter__ = AsyncMock(return_value=mock_transaction)
+    mock_transaction.__aexit__ = AsyncMock(return_value=False)
+    mock_transaction.batch_ = MagicMock(
+        return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_batcher),
+            __aexit__=AsyncMock(return_value=False),
+        )
+    )
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db = MagicMock()
+    mock_prisma_client.db.tx = MagicMock(return_value=mock_transaction)
+    mock_prisma_client._spend_log_transactions_lock = AsyncMock()
+    mock_prisma_client.spend_log_transactions = []
+    return mock_prisma_client, mock_batcher
+
+
+@pytest.mark.asyncio
+async def test_logged_spend_updates_verification_token_spend_when_token_provided():
+    """
+    Successful logged spend must increment LiteLLM_VerificationToken.spend
+    for the hashed key written to SpendLogs.
+    """
+    db_writer = DBSpendUpdateWriter()
+    hashed_token = "a" * 64
+    response_cost = 0.05
+    mock_prisma_client, mock_batcher = _mock_prisma_for_key_spend_commit()
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+
+    with patch("litellm.proxy.proxy_server.disable_spend_logs", False), patch(
+        "litellm.proxy.proxy_server.prisma_client", mock_prisma_client
+    ), patch(
+        "litellm.proxy.proxy_server.user_api_key_cache", mock_cache
+    ), patch(
+        "litellm.proxy.proxy_server.litellm_proxy_budget_name", "test-budget"
+    ), patch(
+        "litellm.proxy.proxy_server.general_settings", {}
+    ), patch(
+        "litellm.proxy.proxy_server.master_key", None
+    ):
+        await db_writer.update_database(
+            token=hashed_token,
+            user_id=None,
+            end_user_id=None,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            team_id=None,
+            org_id=None,
+            completion_response=MagicMock(),
+            response_cost=response_cost,
+            kwargs={
+                "model": "gpt-4",
+                "custom_llm_provider": "openai",
+                "litellm_params": {"metadata": {"user_api_key": hashed_token}},
+            },
+        )
+        await asyncio.sleep(0)
+
+        aggregated = await db_writer.spend_update_queue.flush_and_get_aggregated_db_spend_update_transactions()
+        assert aggregated["key_list_transactions"][hashed_token] == response_cost
+
+        with patch("litellm.proxy.utils._raise_failed_update_spend_exception"):
+            await db_writer._commit_spend_updates_to_db(
+                prisma_client=mock_prisma_client,
+                n_retry_times=0,
+                proxy_logging_obj=MagicMock(),
+                db_spend_update_transactions=aggregated,
+            )
+
+    mock_batcher.litellm_verificationtoken.update_many.assert_called()
+    call_kwargs = mock_batcher.litellm_verificationtoken.update_many.call_args[1]
+    assert call_kwargs["where"] == {"token": hashed_token}
+    assert call_kwargs["data"]["spend"] == {"increment": response_cost}
+
+
+@pytest.mark.asyncio
+async def test_logged_spend_updates_verification_token_spend_from_spend_log_api_key():
+    """
+    Fixes #37144: SpendLogs can persist api_key from standard_logging_object
+    even when update_database is called with token=None (metadata.user_api_key
+    missing, but user/team ids still trigger spend tracking).
+
+    LiteLLM_VerificationToken.spend must increment for that same api_key.
+    """
+    db_writer = DBSpendUpdateWriter()
+    hashed_token = "b" * 64
+    response_cost = 0.123
+    mock_prisma_client, mock_batcher = _mock_prisma_for_key_spend_commit()
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+
+    kwargs = {
+        "model": "custom_openai/test-model",
+        "custom_llm_provider": "openai",
+        "litellm_params": {
+            "metadata": {
+                "user_api_key_user_id": "user-1",
+                "user_api_key_team_id": "team-1",
+            }
+        },
+        "standard_logging_object": {
+            "response_cost": response_cost,
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+            "metadata": {"user_api_key_hash": hashed_token},
+        },
+    }
+
+    with patch("litellm.proxy.proxy_server.disable_spend_logs", False), patch(
+        "litellm.proxy.proxy_server.prisma_client", mock_prisma_client
+    ), patch(
+        "litellm.proxy.proxy_server.user_api_key_cache", mock_cache
+    ), patch(
+        "litellm.proxy.proxy_server.litellm_proxy_budget_name", "test-budget"
+    ), patch(
+        "litellm.proxy.proxy_server.general_settings", {}
+    ), patch(
+        "litellm.proxy.proxy_server.master_key", None
+    ):
+        await db_writer.update_database(
+            token=None,
+            user_id="user-1",
+            end_user_id=None,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            team_id="team-1",
+            org_id=None,
+            completion_response=MagicMock(),
+            response_cost=response_cost,
+            kwargs=kwargs,
+        )
+        await asyncio.sleep(0)
+
+        spend_log_api_key = mock_prisma_client.spend_log_transactions[0]["api_key"]
+        assert spend_log_api_key == hashed_token
+
+        aggregated = await db_writer.spend_update_queue.flush_and_get_aggregated_db_spend_update_transactions()
+        assert hashed_token in aggregated["key_list_transactions"], (
+            "VerificationToken.spend was not queued for the SpendLogs api_key"
+        )
+        assert aggregated["key_list_transactions"][hashed_token] == response_cost
+
+        with patch("litellm.proxy.utils._raise_failed_update_spend_exception"):
+            await db_writer._commit_spend_updates_to_db(
+                prisma_client=mock_prisma_client,
+                n_retry_times=0,
+                proxy_logging_obj=MagicMock(),
+                db_spend_update_transactions=aggregated,
+            )
+
+    mock_batcher.litellm_verificationtoken.update_many.assert_called()
+    call_kwargs = mock_batcher.litellm_verificationtoken.update_many.call_args[1]
+    assert call_kwargs["where"] == {"token": hashed_token}
+    assert call_kwargs["data"]["spend"] == {"increment": response_cost}
+
+
+def test_resolve_hashed_token_for_key_spend_uses_payload_when_token_missing():
+    hashed = "c" * 64
+    assert (
+        DBSpendUpdateWriter._resolve_hashed_token_for_key_spend(
+            hashed_token=None, payload_api_key=hashed
+        )
+        == hashed
+    )
+    assert (
+        DBSpendUpdateWriter._resolve_hashed_token_for_key_spend(
+            hashed_token="", payload_api_key=hashed
+        )
+        == hashed
+    )
+    assert (
+        DBSpendUpdateWriter._resolve_hashed_token_for_key_spend(
+            hashed_token="existing-token", payload_api_key=hashed
+        )
+        == "existing-token"
+    )

@@ -169,6 +169,9 @@ class _ProxyDBLogger(CustomLogger):
 
             if response_cost is not None:
                 user_api_key = metadata.get("user_api_key", None)
+                if not user_api_key and sl_object is not None:
+                    sl_metadata = sl_object.get("metadata") or {}
+                    user_api_key = sl_metadata.get("user_api_key_hash")
                 if kwargs.get("cache_hit", False) is True:
                     response_cost = 0.0
                     verbose_proxy_logger.debug(
