@@ -1553,6 +1553,8 @@ async def test_logged_spend_updates_verification_token_spend_from_spend_log_api_
             "prompt_tokens": 10,
             "completion_tokens": 20,
             "total_tokens": 30,
+            "model_map_information": None,
+            "hidden_params": {},
             "metadata": {"user_api_key_hash": hashed_token},
         },
     }
@@ -1591,12 +1593,22 @@ async def test_logged_spend_updates_verification_token_spend_from_spend_log_api_
         )
         assert aggregated["key_list_transactions"][hashed_token] == response_cost
 
+        key_only_transactions = {
+            "user_list_transactions": {},
+            "end_user_list_transactions": {},
+            "key_list_transactions": aggregated["key_list_transactions"],
+            "team_list_transactions": {},
+            "team_member_list_transactions": {},
+            "org_list_transactions": {},
+            "tag_list_transactions": {},
+            "agent_list_transactions": {},
+        }
         with patch("litellm.proxy.utils._raise_failed_update_spend_exception"):
             await db_writer._commit_spend_updates_to_db(
                 prisma_client=mock_prisma_client,
                 n_retry_times=0,
                 proxy_logging_obj=MagicMock(),
-                db_spend_update_transactions=aggregated,
+                db_spend_update_transactions=key_only_transactions,
             )
 
     mock_batcher.litellm_verificationtoken.update_many.assert_called()
